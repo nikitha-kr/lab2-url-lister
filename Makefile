@@ -1,43 +1,93 @@
-USER=$(shell whoami)
+# Makefile for Hadoop Streaming UrlCount (Python-only)
 
-##
-## Configure the Hadoop classpath for the GCP dataproc enviornment
-##
+# Wikipedia pages to fetch (change if your instructor provides different ones)
+WIKI1 := https://en.wikipedia.org/wiki/Apache_Hadoop
+WIKI2 := https://en.wikipedia.org/wiki/MapReduce
 
-HADOOP_CLASSPATH=$(shell hadoop classpath)
+# Try to auto-locate the Hadoop Streaming jar
+HSTREAM := $(shell ls $$HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-*.jar 2>/dev/null | head -n1)
+ifeq ($(HSTREAM),)
+HSTREAM := $(shell hadoop classpath --glob | tr ':' '\n' | grep -m1 'hadoop-streaming.*\.jar')
+endif
 
-WordCount1.jar: WordCount1.java
-	javac -classpath $(HADOOP_CLASSPATH) -d ./ WordCount1.java
-	jar cf WordCount1.jar WordCount1*.class	
-	-rm -f WordCount1*.class
+.PHONY: prepare fetch-input clean-output stream stream-test filesystem upload-hdfs stream-hdfs stream-hdfs-time results-local results-hdfs
 
-prepare:
-	-hdfs dfs -mkdir input
-	curl https://en.wikipedia.org/wiki/Apache_Hadoop > /tmp/input.txt
-	hdfs dfs -put /tmp/input.txt input/file01
-	curl https://en.wikipedia.org/wiki/MapReduce > /tmp/input.txt
-	hdfs dfs -put /tmp/input.txt input/file02
+# 1) Download inputs (HTML) into ./input
+fetch-input:
+	@mkdir -p input
+	@echo ">> Downloading Wikipedia pages into ./input ..."
+	@if command -v curl >/dev/null 2>&1; then \
+	  echo ">> Using curl"; \
+	  curl -L -sS --compressed -A "Mozilla/5.0 (lab-2-convert-wordcount-to-urlcount-nikitha-kr)" "$(WIKI1)" -o input/wiki1.html; \
+	  curl -L -sS --compressed -A "Mozilla/5.0 (ab-2-convert-wordcount-to-urlcount-nikitha-kr)" "$(WIKI2)" -o input/wiki2.html; \
+	else \
+	  echo ">> Using wget"; \
+	  wget -q --user-agent="Mozilla/5.0 (ab-2-convert-wordcount-to-urlcount-nikitha-kr)" -O input/wiki1.html "$(WIKI1)"; \
+	  wget -q --user-agent="Mozilla/5.0 (ab-2-convert-wordcount-to-urlcount-nikitha-kr)" -O input/wiki2.html "$(WIKI2)"; \
+	fi
+	@echo ">> Done. Files:"; ls -lh input
 
+# Alias expected by some instructions
+prepare: fetch-input
+	@echo ">> To use HDFS, run: make filesystem && make upload-hdfs"
+
+# Clean local and (if present) HDFS outputs
+clean-output:
+	- hdfs dfs -rm -r -f output 2>/dev/null || true
+	- rm -rf output || true
+	- hdfs dfs -rm -r -f /user/$$USER/output 2>/dev/null || true
+
+# 2) Quick local sanity test (no Hadoop): mapper -> sort -> reducer
+stream-test:
+	cat input/* | python3 Mapper.py | sort | python3 Reducer.py | sort | sed -n '1,200p'
+
+# 3) Hadoop Streaming on local FS: input=./input, output=./output
+stream: clean-output
+	hadoop jar "$(HSTREAM)" \
+	  -D mapreduce.job.name="URLCount Streaming (local)" \
+	  -files Mapper.py,Reducer.py \
+	  -mapper "python3 Mapper.py" \
+	  -reducer "python3 Reducer.py" \
+	  -input input \
+	  -output output
+	@$(MAKE) results-local
+
+results-local:
+	@echo ">> Results (sorted, local):"; \
+	  cat output/part-* | sort | sed -n '1,200p' || true
+
+# 4) HDFS helpers (for Dataproc or local HDFS)
 filesystem:
-	-hdfs dfs -mkdir /user
-	-hdfs dfs -mkdir /user/$(USER)
+	hdfs dfs -mkdir -p /user/$$USER/input || true
 
-run: WordCount1.jar
-	-rm -rf output
-	hadoop jar WordCount1.jar WordCount1 input output
+upload-hdfs:
+	hdfs dfs -mkdir -p /user/$$USER/input || true
+	hdfs dfs -put -f input/* /user/$$USER/input
 
+# 5) Hadoop Streaming on HDFS
+stream-hdfs:
+	hdfs dfs -rm -r -f /user/$$USER/output || true
+	hadoop jar "$(HSTREAM)" \
+	  -D mapreduce.job.name="URLCount Streaming (HDFS)" \
+	  -files Mapper.py,Reducer.py \
+	  -mapper "python3 Mapper.py" \
+	  -reducer "python3 Reducer.py" \
+	  -input /user/$$USER/input \
+	  -output /user/$$USER/output
+	@$(MAKE) results-hdfs
 
-##
-## You may need to change the path for this depending
-## on your Hadoop / java setup
-##
-HADOOP_V=3.3.4
-STREAM_JAR = /usr/local/hadoop-$(HADOOP_V)/share/hadoop/tools/lib/hadoop-streaming-$(HADOOP_V).jar
+# 6) Same as above, but prints wall-clock time
+stream-hdfs-time:
+	hdfs dfs -rm -r -f /user/$$USER/output || true
+	time hadoop jar "$(HSTREAM)" \
+	  -D mapreduce.job.name="URLCount Streaming (HDFS timed)" \
+	  -files Mapper.py,Reducer.py \
+	  -mapper "python3 Mapper.py" \
+	  -reducer "python3 Reducer.py" \
+	  -input /user/$$USER/input \
+	  -output /user/$$USER/output
+	@$(MAKE) results-hdfs
 
-stream:
-	-rm -rf stream-output
-	hadoop jar $(STREAM_JAR) \
-	-mapper Mapper.py \
-	-reducer Reducer.py \
-	-file Mapper.py -file Reducer.py \
-	-input input -output stream-output
+results-hdfs:
+	@echo ">> Results (sorted, HDFS):"; \
+	  hdfs dfs -cat /user/$$USER/output/part-* | sort | sed -n '1,200p' || true
